@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hand Synth — Slice D</title>
+
+  <!-- Three.js import map — must appear before any module scripts -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three":          "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      opacity: 0;              /* hidden by default; C key toggles */
+      transition: opacity 0.3s;
+      z-index: 1;
+    }
+
+    #canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 2;              /* landmark overlay above video */
+    }
+
+    /* Three.js canvas is inserted at z-index 5 by main.js */
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.8;
+      pointer-events: none;
+      z-index: 10;
+      opacity: 0.6;
+    }
+
+    #fps       { color: #0ff; text-shadow: 0 0 8px #0ff; }
+    #handCount { color: #0ff; text-shadow: 0 0 8px #0ff; }
+    #rightInfo { color: #ff00ff; text-shadow: 0 0 8px #ff00ff; }
+    #leftInfo  { color: #00ffff; text-shadow: 0 0 8px #00ffff; }
+
+    #status {
+      position: absolute;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #555;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      pointer-events: none;
+      transition: opacity 1s;
+      z-index: 10;
+    }
+
+    #overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.88);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      cursor: pointer;
+    }
+
+    #overlay-title {
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      font-size: 3rem;
+      text-shadow: 0 0 30px #0ff;
+      letter-spacing: 0.15em;
+      margin-bottom: 1.5rem;
+    }
+
+    #overlay-sub {
+      color: #aaa;
+      font-family: 'Courier New', monospace;
+      font-size: 1rem;
+      letter-spacing: 0.1em;
+    }
+  </style>
+</head>
+<body>
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="hud">
+    <div id="fps">FPS: —</div>
+    <div id="handCount">Hands: 0</div>
+    <div id="rightInfo">R: —</div>
+    <div id="leftInfo">L: —</div>
+  </div>
+
+  <div id="status">Initializing camera…</div>
+
+  <div id="overlay">
+    <div id="overlay-title">HAND SYNTH</div>
+    <div id="overlay-sub">click to start audio</div>
+  </div>
+
+  <!-- MediaPipe Hands + Camera utils from CDN (non-module, load synchronously) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <!-- Tone.js from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/tone@14/build/Tone.js" crossorigin="anonymous"></script>
+
+  <script>
+    // ── Shared state (read by main.js Three.js module) ────────────────────────
+    window.synthState = {
+      handsData:    [],      // [{landmarks, label, smoothPinch}]
+      analyserNode: null,    // Tone.Analyser (FFT 32 bins)
+      leadFreq:     261.63,  // Hz, right-hand lead voice
+      bassFreq:     130.81,  // Hz, left-hand bass voice
+    };
+
+    // ── DOM ───────────────────────────────────────────────────────────────────
+    const video       = document.getElementById('video');
+    const canvas      = document.getElementById('canvas');
+    const ctx         = canvas.getContext('2d');
+    const fpsEl       = document.getElementById('fps');
+    const handCountEl = document.getElementById('handCount');
+    const statusEl    = document.getElementById('status');
+    const rightInfoEl = document.getElementById('rightInfo');
+    const leftInfoEl  = document.getElementById('leftInfo');
+    const overlayEl   = document.getElementById('overlay');
+
+    // ── MediaPipe constants ───────────────────────────────────────────────────
+    const CONNECTIONS = [
+      [0,1],[0,5],[0,17],[5,9],[9,13],[13,17],
+      [1,2],[2,3],[3,4],
+      [5,6],[6,7],[7,8],
+      [9,10],[10,11],[11,12],
+      [13,14],[14,15],[15,16],
+      [17,18],[18,19],[19,20],
+    ];
+
+    // Cyan = user's left hand, Magenta = user's right hand.
+    // MediaPipe "Right" (camera right = user's left) → cyan.
+    const HAND_COLOR = { Right: '#00ffff', Left: '#ff00ff' };
+
+    // ── Scale constants ───────────────────────────────────────────────────────
+    const PENTA_LEAD = ['C4','D4','E4','G4','A4','C5','D5','E5','G5','A5'];
+    const PENTA_BASS = ['C3','D3','E3','G3','A3','C4','D4','E4','G4','A4'];
+
+    // Filter cutoff bounds (Hz) — logarithmic mapping
+    const LOG_CUTOFF_LOW  = Math.log(200);
+    const LOG_CUTOFF_HIGH = Math.log(8000);
+
+    // ── Display toggles ───────────────────────────────────────────────────────
+    let showWebcam    = false;
+    let showLandmarks = false; // off by default in Slice D
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'c' || e.key === 'C') {
+        showWebcam = !showWebcam;
+        video.style.opacity = showWebcam ? '1' : '0';
+        // Notify Three.js canvas (it listens for this global)
+        window.synthState.showWebcam = showWebcam;
+      }
+      if (e.key === 'h' || e.key === 'H') {
+        showLandmarks = !showLandmarks;
+      }
+    });
+
+    // ── Audio nodes ───────────────────────────────────────────────────────────
+    let audioStarted = false;
+    let leadVoice = null, bassVoice   = null;
+    let leadFilter = null, bassFilter = null;
+
+    // ── Per-hand smoothed state ───────────────────────────────────────────────
+    function makeHandState() {
+      return {
+        smoothPinch:     0,
+        smoothLogCutoff: LOG_CUTOFF_HIGH,
+        smoothMorph:     0,
+        currentFreq:     261.63,
+      };
+    }
+    const handState = { lead: makeHandState(), bass: makeHandState() };
+
+    // ── FPS tracking ──────────────────────────────────────────────────────────
+    let frameCount  = 0;
+    let lastFpsTime = performance.now();
+
+    // ── Canvas resize ─────────────────────────────────────────────────────────
+    function resizeCanvas() {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ── Math helpers ──────────────────────────────────────────────────────────
+    function dist2D(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function lerp(a, b, t) { return a + (b - a) * t; }
+
+    function yToCutoff(y) {
+      return Math.exp(LOG_CUTOFF_HIGH + y * (LOG_CUTOFF_LOW - LOG_CUTOFF_HIGH));
+    }
+
+    function calcTiltMorph(lm) {
+      const wrist  = lm[0];
+      const midMcp = lm[9];
+      // MediaPipe normalizes x over image width and y over image height.
+      // The webcam feed is 1280×720, so without correction a 45° physical tilt
+      // only reads as ~30° in normalized space. Scale dx by the aspect ratio so
+      // the function returns values that track the true physical angle.
+      const dx = (midMcp.x - wrist.x) * (16 / 9);
+      const dy = midMcp.y - wrist.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.001) return 0;
+      // Angle between wrist→MCP vector and vertical-up axis (0, -1)
+      const cosA  = Math.max(-1, Math.min(1, -dy / len));
+      const angle = Math.acos(cosA);
+      return Math.min(1, angle / (Math.PI / 2));
+    }
+
+    // ── Audio voice factory ───────────────────────────────────────────────────
+    function makeVoice(startNote, filter) {
+      const masterGain = new Tone.Gain(0).connect(filter);
+      const gainSine   = new Tone.Gain(1).connect(masterGain);
+      const gainSaw    = new Tone.Gain(0).connect(masterGain);
+      const oscSine    = new Tone.Oscillator(startNote, 'sine').connect(gainSine).start();
+      const oscSaw     = new Tone.Oscillator(startNote, 'sawtooth').connect(gainSaw).start();
+      return { oscSine, oscSaw, gainSine, gainSaw, masterGain };
+    }
+
+    // ── Audio init ────────────────────────────────────────────────────────────
+    async function initAudio() {
+      await Tone.start();
+
+      const reverb = new Tone.Reverb({ decay: 2.5, wet: 0.3 }).toDestination();
+      await reverb.generate();
+
+      // Tap reverb output for FFT analysis (fan-out: reverb → destination AND → analyser)
+      const analyser = new Tone.Analyser('fft', 32);
+      reverb.connect(analyser);
+      window.synthState.analyserNode = analyser;
+
+      leadFilter = new Tone.Filter(8000, 'lowpass').connect(reverb);
+      bassFilter = new Tone.Filter(8000, 'lowpass').connect(reverb);
+
+      leadVoice = makeVoice('C4', leadFilter);
+      bassVoice = makeVoice('C3', bassFilter);
+    }
+
+    // ── Per-hand voice update ─────────────────────────────────────────────────
+    function updateVoice(voice, filter, state, lm, scale, infoEl, label) {
+      const wrist    = lm[0];
+      const thumbTip = lm[4];
+      const indexTip = lm[8];
+      const midMcp   = lm[9];
+
+      // X → Pitch
+      const mirX    = 1 - wrist.x;
+      const noteIdx = Math.min(Math.floor(mirX * scale.length), scale.length - 1);
+      const note    = scale[noteIdx];
+      const freq    = Tone.Frequency(note).toFrequency();
+      voice.oscSine.frequency.rampTo(freq, 0.05);
+      voice.oscSaw.frequency.rampTo(freq, 0.05);
+      state.currentFreq = freq;
+
+      // Pinch → Volume
+      const handSize = dist2D(wrist, midMcp);
+      const rawPinch = handSize > 0.001
+        ? Math.min(1, dist2D(thumbTip, indexTip) / handSize)
+        : 0;
+      const PINCH_CLOSED = 0.15;
+      const mappedPinch  = Math.max(0, (rawPinch - PINCH_CLOSED) / (1 - PINCH_CLOSED));
+      state.smoothPinch  = lerp(state.smoothPinch, mappedPinch, 0.2);
+      voice.masterGain.gain.rampTo(state.smoothPinch, 0.05);
+
+      // Y → Filter cutoff
+      const rawLogCutoff    = Math.log(yToCutoff(wrist.y));
+      state.smoothLogCutoff = lerp(state.smoothLogCutoff, rawLogCutoff, 0.2);
+      filter.frequency.rampTo(Math.exp(state.smoothLogCutoff), 0.05);
+
+      // Tilt → Waveform morph (sine ↔ sawtooth, equal-power crossfade)
+      state.smoothMorph = lerp(state.smoothMorph, calcTiltMorph(lm), 0.15);
+      const crossAngle  = state.smoothMorph * (Math.PI / 2);
+      voice.gainSine.gain.rampTo(Math.cos(crossAngle), 0.05);
+      voice.gainSaw.gain.rampTo(Math.sin(crossAngle), 0.05);
+
+      // HUD
+      const pinchPct = Math.round(state.smoothPinch * 100);
+      const cutoffHz = Math.round(Math.exp(state.smoothLogCutoff));
+      const morphVal = state.smoothMorph.toFixed(2);
+      infoEl.textContent = `${label}: ${note} | ${pinchPct}% | tilt:${morphVal} | ${cutoffHz}Hz`;
+    }
+
+    // ── Visuals (2D landmark overlay) ─────────────────────────────────────────
+    function drawHand(landmarks, color) {
+      const W = canvas.width, H = canvas.height;
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 2;
+      ctx.shadowColor = color;
+      ctx.shadowBlur  = 10;
+      ctx.beginPath();
+      for (const [a, b] of CONNECTIONS) {
+        const lA = landmarks[a], lB = landmarks[b];
+        ctx.moveTo((1 - lA.x) * W, lA.y * H);
+        ctx.lineTo((1 - lB.x) * W, lB.y * H);
+      }
+      ctx.stroke();
+      ctx.fillStyle  = color;
+      ctx.shadowBlur = 16;
+      for (const lm of landmarks) {
+        ctx.beginPath();
+        ctx.arc((1 - lm.x) * W, lm.y * H, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // ── Main results handler ──────────────────────────────────────────────────
+    function onResults(results) {
+      frameCount++;
+      const now     = performance.now();
+      const elapsed = now - lastFpsTime;
+      if (elapsed >= 1000) {
+        fpsEl.textContent = `FPS: ${Math.round((frameCount * 1000) / elapsed)}`;
+        frameCount  = 0;
+        lastFpsTime = now;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const landmarks  = results.multiHandLandmarks || [];
+      const handedness = results.multiHandedness    || [];
+
+      handCountEl.textContent = `Hands: ${landmarks.length}`;
+
+      let rightSeen = false;
+      let leftSeen  = false;
+      const handsForThree = [];
+
+      for (let i = 0; i < landmarks.length; i++) {
+        const label = handedness[i]?.label ?? 'Right';
+        const color = HAND_COLOR[label] ?? '#00ffff';
+
+        if (showLandmarks) drawHand(landmarks[i], color);
+
+        const isRight = (label === 'Left'); // MediaPipe "Left" = user's right hand
+        const state   = isRight ? handState.lead : handState.bass;
+
+        if (audioStarted) {
+          if (isRight) {
+            rightSeen = true;
+            updateVoice(leadVoice, leadFilter, handState.lead, landmarks[i], PENTA_LEAD, rightInfoEl, 'R');
+          } else {
+            leftSeen = true;
+            updateVoice(bassVoice, bassFilter, handState.bass, landmarks[i], PENTA_BASS, leftInfoEl, 'L');
+          }
+        }
+
+        handsForThree.push({ landmarks: landmarks[i], label, smoothPinch: state.smoothPinch });
+      }
+
+      // Update shared state for Three.js
+      window.synthState.handsData = handsForThree;
+      window.synthState.leadFreq  = handState.lead.currentFreq;
+      window.synthState.bassFreq  = handState.bass.currentFreq;
+
+      if (audioStarted) {
+        if (!rightSeen) {
+          leadVoice.masterGain.gain.rampTo(0, 0.3);
+          handState.lead.smoothPinch = 0;
+          rightInfoEl.textContent = 'R: —';
+        }
+        if (!leftSeen) {
+          bassVoice.masterGain.gain.rampTo(0, 0.3);
+          handState.bass.smoothPinch = 0;
+          leftInfoEl.textContent = 'L: —';
+        }
+      }
+    }
+
+    // ── Overlay ───────────────────────────────────────────────────────────────
+    overlayEl.addEventListener('click', async () => {
+      overlayEl.style.pointerEvents = 'none';
+      try {
+        await initAudio();
+        audioStarted = true;
+        overlayEl.style.transition = 'opacity 0.5s';
+        overlayEl.style.opacity    = '0';
+        setTimeout(() => overlayEl.remove(), 600);
+      } catch (err) {
+        console.error('Audio init failed:', err);
+        overlayEl.style.pointerEvents = 'auto';
+      }
+    });
+
+    // ── MediaPipe setup ───────────────────────────────────────────────────────
+    const hands = new Hands({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    });
+
+    hands.setOptions({
+      maxNumHands:            2,
+      modelComplexity:        1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence:  0.5,
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width:  1280,
+      height: 720,
+    });
+
+    camera.start().then(() => {
+      statusEl.style.opacity = '0';
+      setTimeout(() => statusEl.remove(), 1200);
+    }).catch((err) => {
+      statusEl.textContent = `Camera error: ${err.message}`;
+      statusEl.style.color = '#f55';
+    });
+  </script>
+
+  <!-- Three.js visualization (ES module, deferred automatically) -->
+  <script type="module" src="main.js"></script>
+</body>
+</html>
