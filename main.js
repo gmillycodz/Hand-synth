@@ -7,8 +7,8 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.toneMapping         = THREE.ReinhardToneMapping;
-renderer.toneMappingExposure = 1.5;
+renderer.toneMapping         = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
 renderer.outputColorSpace    = THREE.SRGBColorSpace;
 
 // mix-blend-mode: screen makes black pixels transparent against DOM layers
@@ -37,11 +37,13 @@ const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
 const bloom = new UnrealBloomPass(
   new THREE.Vector2(window.innerWidth, window.innerHeight),
-  1.2,   // strength
-  0.6,   // radius
-  0.2,   // threshold
+  1.8,   // strength
+  0.8,   // radius
+  0.0,   // threshold — bloom everything
 );
 composer.addPass(bloom);
+
+console.log('[HandSynth] EffectComposer ready. UnrealBloomPass added (strength=1.8, radius=0.8, threshold=0). composer.render() is active.');
 
 // ── Resize ────────────────────────────────────────────────────────────────────
 window.addEventListener('resize', () => {
@@ -109,7 +111,7 @@ function updateIco(fftData, state) {
   const hue = Math.max(0, Math.min(1,
     ((Math.log(lf) + Math.log(bf)) / 2 - LOG_FREQ_MIN) / (LOG_FREQ_MAX - LOG_FREQ_MIN)
   ));
-  icoMesh.material.color.setHSL(hue, 1.0, 0.55);
+  icoMesh.material.color.setHSL(hue, 1.0, 0.5).multiplyScalar(2.5); // HDR for bloom
 
   // Hand-driven rotation, position, and scale
   const hands = state?.handsData || [];
@@ -275,7 +277,7 @@ function updateParticles(dt, state) {
 // Slot 0 = MediaPipe "Left" = user's right hand = magenta
 // Slot 1 = MediaPipe "Right" = user's left hand = cyan
 const ORB_HAND_LABELS  = ['Left', 'Right'];
-const ORB_HAND_COLORS  = [{ r:1, g:0, b:1 }, { r:0, g:1, b:1 }];
+const ORB_HAND_COLORS  = [{ r:3, g:0, b:3 }, { r:0, g:3, b:3 }]; // HDR values drive bloom
 
 const ORB_RADIUS    = 0.05;
 const TRAIL_LEN     = 15;
@@ -286,6 +288,23 @@ const FADE_OUT_TIME = 0.2;  // seconds to disappear
 
 // Shared geometry — all 10 orbs use the same shape, different materials
 const ORB_GEO = new THREE.SphereGeometry(ORB_RADIUS, 8, 8);
+
+function makeBeamLine(r, g, b) {
+  const pos = new Float32Array(6); // 2 vertices × 3 floats
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+  const mat = new THREE.LineBasicMaterial({
+    color:       new THREE.Color(r, g, b),
+    transparent: true,
+    opacity:     0,
+    blending:    THREE.AdditiveBlending,
+    depthWrite:  false,
+  });
+  const line = new THREE.Line(geo, mat);
+  line.visible = false;
+  scene.add(line);
+  return { line, geo, pos, mat };
+}
 
 function makeOrbData(handIdx, tipLandmarkIdx) {
   const { r, g, b } = ORB_HAND_COLORS[handIdx];
@@ -316,9 +335,12 @@ function makeOrbData(handIdx, tipLandmarkIdx) {
   trailLine.visible = false;
   scene.add(trailLine);
 
+  const beam = makeBeamLine(r, g, b);
+
   return {
     mesh, mat,
     trailLine, trailGeo, trailPos, trailCol,
+    beam,
     handIdx, tipLandmarkIdx,
     baseR: r, baseG: g, baseB: b,
     currentPos:     new THREE.Vector3(), // reused each frame — no allocation in hot path
@@ -431,6 +453,21 @@ function updateFingerOrbs(dt, state) {
       orb.trailLine.visible = orb.brightness > 0;
     } else {
       orb.trailLine.visible = false;
+    }
+
+    // ── Beam from fingertip to icosahedron center ─────────────────────────────
+    if (orb.brightness > 0) {
+      orb.beam.pos[0] = orb.currentPos.x;
+      orb.beam.pos[1] = orb.currentPos.y;
+      orb.beam.pos[2] = orb.currentPos.z;
+      orb.beam.pos[3] = icoMesh.position.x;
+      orb.beam.pos[4] = icoMesh.position.y;
+      orb.beam.pos[5] = icoMesh.position.z;
+      orb.beam.geo.attributes.position.needsUpdate = true;
+      orb.beam.mat.opacity = orb.brightness * 0.5;
+      orb.beam.line.visible = true;
+    } else {
+      orb.beam.line.visible = false;
     }
   }
 }
